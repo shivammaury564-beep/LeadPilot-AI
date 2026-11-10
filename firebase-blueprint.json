@@ -1,0 +1,492 @@
+{
+  "entities": {
+    "Profile": {
+      "title": "Profile",
+      "description": "User profile and daily lead discovery workflow configuration.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "fullName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Full name of the user"
+        },
+        "agencyName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Website development agency or freelancer brand name"
+        },
+        "dailyTarget": {
+          "type": "integer",
+          "description": "Daily lead research goal between 10 and 200"
+        },
+        "defaultCity": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Default target city for daily discovery"
+        },
+        "defaultCategory": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Default business category"
+        },
+        "researchPriority": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Priority focus for lead qualification"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": ["userId", "fullName", "dailyTarget", "createdAt", "updatedAt"]
+    },
+    "Lead": {
+      "title": "Lead",
+      "description": "Business prospect discovered via Google Places, Instagram, Facebook, or manual research.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "businessName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Official business name"
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Business category"
+        },
+        "city": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "City location"
+        },
+        "state": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "State or province"
+        },
+        "country": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Country"
+        },
+        "address": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Formatted street address"
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Public business phone number"
+        },
+        "websiteUrl": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Official website URL if available"
+        },
+        "websiteStatus": {
+          "type": "string",
+          "enum": ["missing_verified", "outdated_verified", "modern_verified", "unverified"],
+          "maxLength": 40,
+          "description": "Verification state of the business website"
+        },
+        "hasOnlineBooking": {
+          "type": "boolean",
+          "description": "Whether the business has verified online booking"
+        },
+        "isPremiumService": {
+          "type": "boolean",
+          "description": "Whether the business operates in a high-ticket or premium category"
+        },
+        "hasActivePublicProfile": {
+          "type": "boolean",
+          "description": "Whether the business has an active public profile"
+        },
+        "instagramUrl": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Public Instagram business profile URL"
+        },
+        "facebookUrl": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Public Facebook business page URL"
+        },
+        "googlePlaceId": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Google Maps Place ID"
+        },
+        "googleMapsUrl": {
+          "type": "string",
+          "maxLength": 600,
+          "description": "Direct Google Maps URI"
+        },
+        "rating": {
+          "type": "number",
+          "description": "Public rating from 0 to 5"
+        },
+        "reviewCount": {
+          "type": "integer",
+          "description": "Total public review count"
+        },
+        "leadScore": {
+          "type": "integer",
+          "description": "Calculated transparent lead score from 0 to 100"
+        },
+        "source": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Discovery source (google_places, instagram, facebook, manual, chrome_extension)"
+        },
+        "verificationStatus": {
+          "type": "string",
+          "enum": ["verified", "unverified", "needs_review"],
+          "maxLength": 40,
+          "description": "Verification status of business details"
+        },
+        "lastVerifiedAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "ISO timestamp of last verification"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "new",
+            "researching",
+            "qualified",
+            "draft_ready",
+            "approved",
+            "contacted",
+            "replied",
+            "interested",
+            "demo_sent",
+            "negotiation",
+            "converted",
+            "not_interested",
+            "opted_out"
+          ],
+          "maxLength": 40,
+          "description": "Current CRM pipeline status"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "User research notes"
+        },
+        "tags": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Comma-separated tags"
+        },
+        "lastContactedAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "ISO timestamp of last outreach contact"
+        },
+        "nextFollowUpAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "ISO timestamp of next scheduled follow-up"
+        },
+        "aiResearchJson": {
+          "type": "string",
+          "maxLength": 15000,
+          "description": "Serialized Gemini structured business research summary"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": [
+        "userId",
+        "businessName",
+        "category",
+        "websiteStatus",
+        "leadScore",
+        "source",
+        "verificationStatus",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Outreach message draft, approval state, and manual send record.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "leadId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated lead document ID"
+        },
+        "leadBusinessName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Associated lead business name"
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["instagram", "facebook", "whatsapp", "email"],
+          "maxLength": 40,
+          "description": "Target outreach channel"
+        },
+        "messageBody": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "description": "Personalized message content"
+        },
+        "language": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Message language (English, Hindi, Hinglish)"
+        },
+        "tone": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Message style/tone"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "approved", "sent", "replied", "opted_out"],
+          "maxLength": 40,
+          "description": "Workflow state of the message"
+        },
+        "approvedAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Timestamp when approved by user"
+        },
+        "sentAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Timestamp when manually sent by user"
+        },
+        "replyNotes": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Recorded prospect reply or opt-out note"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp"
+        }
+      },
+      "required": [
+        "userId",
+        "leadId",
+        "platform",
+        "messageBody",
+        "language",
+        "tone",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Activity": {
+      "title": "Activity",
+      "description": "Audit log and timeline entry for a lead.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "leadId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated lead ID"
+        },
+        "activityType": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Type of event"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Human-readable description"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": ["userId", "leadId", "activityType", "description", "createdAt"]
+    },
+    "Followup": {
+      "title": "Followup",
+      "description": "Scheduled follow-up reminder for a lead.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "leadId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated lead ID"
+        },
+        "leadBusinessName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Business name"
+        },
+        "scheduledAt": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "Scheduled ISO date/time"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "completed", "cancelled"],
+          "maxLength": 40,
+          "description": "Follow-up status"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Follow-up context notes"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp"
+        }
+      },
+      "required": ["userId", "leadId", "scheduledAt", "status", "createdAt", "updatedAt"]
+    },
+    "Integration": {
+      "title": "Integration",
+      "description": "Provider integration status record for the user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID"
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "google_places",
+            "gemini_ai",
+            "firebase_db",
+            "meta_instagram",
+            "meta_facebook",
+            "chrome_extension"
+          ],
+          "maxLength": 60,
+          "description": "Integration provider identifier"
+        },
+        "connectionStatus": {
+          "type": "string",
+          "enum": ["connected", "manual_mode", "action_required", "disconnected"],
+          "maxLength": 40,
+          "description": "Connection status"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Configuration notes"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Update timestamp"
+        }
+      },
+      "required": ["userId", "provider", "connectionStatus", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/profiles/{userId}": {
+      "schema": { "$ref": "#/entities/Profile" },
+      "description": "User profile and daily lead discovery workflow settings."
+    },
+    "/leads/{leadId}": {
+      "schema": { "$ref": "#/entities/Lead" },
+      "description": "User-owned business leads and qualification scores."
+    },
+    "/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/Message" },
+      "description": "User-owned outreach message drafts and sent logs."
+    },
+    "/activities/{activityId}": {
+      "schema": { "$ref": "#/entities/Activity" },
+      "description": "User-owned activity timeline records for leads."
+    },
+    "/followups/{followupId}": {
+      "schema": { "$ref": "#/entities/Followup" },
+      "description": "User-owned scheduled follow-up reminders."
+    },
+    "/integrations/{integrationId}": {
+      "schema": { "$ref": "#/entities/Integration" },
+      "description": "User-owned API integration status records."
+    }
+  }
+}

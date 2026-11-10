@@ -1,0 +1,6 @@
+{
+  "name": "LeadPilot AI",
+  "description": "Personal lead generation, AI business research, lead scoring, and outreach management platform for website development agencies and freelancers.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

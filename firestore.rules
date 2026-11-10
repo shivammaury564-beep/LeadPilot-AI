@@ -1,0 +1,303 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitive Helpers
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOptStr(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptBool(data, field) {
+      return !(field in data) || (data[field] is bool);
+    }
+
+    function isOptNum(data, field) {
+      return !(field in data) || (data[field] is number || data[field] is int);
+    }
+
+    function isValidTimestamp(val) {
+      return (val is string && val.size() >= 1 && val.size() <= 60) || val == request.time;
+    }
+
+    // 1. Profile Validation Blueprint
+    function isValidProfile(data) {
+      return data.keys().hasAll(['userId', 'fullName', 'dailyTarget', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'userId', 'fullName', 'agencyName', 'dailyTarget',
+          'defaultCity', 'defaultCategory', 'researchPriority',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        isOptStr(data, 'agencyName', 120) &&
+        data.dailyTarget is int && data.dailyTarget >= 1 && data.dailyTarget <= 500 &&
+        isOptStr(data, 'defaultCity', 100) &&
+        isOptStr(data, 'defaultCategory', 100) &&
+        isOptStr(data, 'researchPriority', 60) &&
+        isValidTimestamp(data.createdAt) &&
+        isValidTimestamp(data.updatedAt);
+    }
+
+    // 2. Lead Validation Blueprint
+    function isValidLead(data) {
+      return data.keys().hasAll([
+          'userId', 'businessName', 'category', 'websiteStatus',
+          'leadScore', 'source', 'verificationStatus', 'status',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'businessName', 'category', 'city', 'state', 'country',
+          'address', 'phone', 'websiteUrl', 'websiteStatus',
+          'hasOnlineBooking', 'isPremiumService', 'hasActivePublicProfile',
+          'instagramUrl', 'facebookUrl', 'googlePlaceId', 'googleMapsUrl',
+          'rating', 'reviewCount', 'leadScore', 'source',
+          'verificationStatus', 'lastVerifiedAt', 'status', 'notes',
+          'tags', 'lastContactedAt', 'nextFollowUpAt', 'aiResearchJson',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        data.businessName is string && data.businessName.size() >= 1 && data.businessName.size() <= 200 &&
+        data.category is string && data.category.size() <= 100 &&
+        isOptStr(data, 'city', 100) &&
+        isOptStr(data, 'state', 100) &&
+        isOptStr(data, 'country', 100) &&
+        isOptStr(data, 'address', 400) &&
+        isOptStr(data, 'phone', 60) &&
+        isOptStr(data, 'websiteUrl', 500) &&
+        data.websiteStatus is string && data.websiteStatus.size() <= 40 &&
+        data.websiteStatus in ['missing_verified', 'outdated_verified', 'modern_verified', 'unverified'] &&
+        isOptBool(data, 'hasOnlineBooking') &&
+        isOptBool(data, 'isPremiumService') &&
+        isOptBool(data, 'hasActivePublicProfile') &&
+        isOptStr(data, 'instagramUrl', 500) &&
+        isOptStr(data, 'facebookUrl', 500) &&
+        isOptStr(data, 'googlePlaceId', 200) &&
+        isOptStr(data, 'googleMapsUrl', 600) &&
+        isOptNum(data, 'rating') &&
+        isOptNum(data, 'reviewCount') &&
+        data.leadScore is int && data.leadScore >= 0 && data.leadScore <= 100 &&
+        data.source is string && data.source.size() <= 60 &&
+        data.verificationStatus is string && data.verificationStatus.size() <= 40 &&
+        data.verificationStatus in ['verified', 'unverified', 'needs_review'] &&
+        isOptStr(data, 'lastVerifiedAt', 60) &&
+        data.status is string && data.status.size() <= 40 &&
+        data.status in [
+          'new', 'researching', 'qualified', 'draft_ready', 'approved',
+          'contacted', 'replied', 'interested', 'demo_sent', 'negotiation',
+          'converted', 'not_interested', 'opted_out'
+        ] &&
+        isOptStr(data, 'notes', 4000) &&
+        isOptStr(data, 'tags', 500) &&
+        isOptStr(data, 'lastContactedAt', 60) &&
+        isOptStr(data, 'nextFollowUpAt', 60) &&
+        isOptStr(data, 'aiResearchJson', 15000) &&
+        isValidTimestamp(data.createdAt) &&
+        isValidTimestamp(data.updatedAt);
+    }
+
+    // 3. Message Validation Blueprint
+    function isValidMessage(data) {
+      return data.keys().hasAll([
+          'userId', 'leadId', 'platform', 'messageBody',
+          'language', 'tone', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'leadId', 'leadBusinessName', 'platform',
+          'messageBody', 'language', 'tone', 'status',
+          'approvedAt', 'sentAt', 'replyNotes', 'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        isValidId(data.leadId) &&
+        isOptStr(data, 'leadBusinessName', 200) &&
+        data.platform is string && data.platform.size() <= 40 &&
+        data.platform in ['instagram', 'facebook', 'whatsapp', 'email'] &&
+        data.messageBody is string && data.messageBody.size() >= 1 && data.messageBody.size() <= 4000 &&
+        data.language is string && data.language.size() <= 40 &&
+        data.tone is string && data.tone.size() <= 60 &&
+        data.status is string && data.status.size() <= 40 &&
+        data.status in ['draft', 'approved', 'sent', 'replied', 'opted_out'] &&
+        isOptStr(data, 'approvedAt', 60) &&
+        isOptStr(data, 'sentAt', 60) &&
+        isOptStr(data, 'replyNotes', 2000) &&
+        isValidTimestamp(data.createdAt) &&
+        isValidTimestamp(data.updatedAt);
+    }
+
+    // 4. Activity Validation Blueprint
+    function isValidActivity(data) {
+      return data.keys().hasAll(['userId', 'leadId', 'activityType', 'description', 'createdAt']) &&
+        data.keys().hasOnly(['userId', 'leadId', 'activityType', 'description', 'createdAt']) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        isValidId(data.leadId) &&
+        data.activityType is string && data.activityType.size() >= 1 && data.activityType.size() <= 80 &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 1000 &&
+        isValidTimestamp(data.createdAt);
+    }
+
+    // 5. Followup Validation Blueprint
+    function isValidFollowup(data) {
+      return data.keys().hasAll(['userId', 'leadId', 'scheduledAt', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'userId', 'leadId', 'leadBusinessName', 'scheduledAt',
+          'status', 'notes', 'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        isValidId(data.leadId) &&
+        isOptStr(data, 'leadBusinessName', 200) &&
+        data.scheduledAt is string && data.scheduledAt.size() >= 1 && data.scheduledAt.size() <= 60 &&
+        data.status is string && data.status.size() <= 40 &&
+        data.status in ['pending', 'completed', 'cancelled'] &&
+        isOptStr(data, 'notes', 1000) &&
+        isValidTimestamp(data.createdAt) &&
+        isValidTimestamp(data.updatedAt);
+    }
+
+    // 6. Integration Validation Blueprint
+    function isValidIntegration(data) {
+      return data.keys().hasAll(['userId', 'provider', 'connectionStatus', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['userId', 'provider', 'connectionStatus', 'notes', 'createdAt', 'updatedAt']) &&
+        data.userId is string && data.userId.size() <= 128 && data.userId == request.auth.uid &&
+        data.provider is string && data.provider.size() <= 60 &&
+        data.provider in ['google_places', 'gemini_ai', 'firebase_db', 'meta_instagram', 'meta_facebook', 'chrome_extension'] &&
+        data.connectionStatus is string && data.connectionStatus.size() <= 40 &&
+        data.connectionStatus in ['connected', 'manual_mode', 'action_required', 'disconnected'] &&
+        isOptStr(data, 'notes', 500) &&
+        isValidTimestamp(data.createdAt) &&
+        isValidTimestamp(data.updatedAt);
+    }
+
+    // Collection 1: /profiles/{userId}
+    match /profiles/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && userId == request.auth.uid && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(userId) && userId == request.auth.uid && isValidProfile(incoming());
+      allow update: if isSignedIn() && isValidId(userId) && userId == request.auth.uid &&
+        isValidProfile(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'fullName', 'agencyName', 'dailyTarget', 'defaultCity',
+          'defaultCategory', 'researchPriority', 'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isValidId(userId) && userId == request.auth.uid && existing().userId == request.auth.uid;
+    }
+
+    // Collection 2: /leads/{leadId}
+    match /leads/{leadId} {
+      allow get: if isSignedIn() && isValidId(leadId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(leadId) && isValidLead(incoming());
+      allow update: if isSignedIn() && isValidId(leadId) &&
+        isValidLead(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        // Terminal state guard: Opted-out leads can never re-enter active outreach queues
+        !(existing().status == 'opted_out' && incoming().status in ['draft_ready', 'approved', 'contacted']) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'businessName', 'category', 'city', 'state', 'country',
+          'address', 'phone', 'websiteUrl', 'websiteStatus',
+          'hasOnlineBooking', 'isPremiumService', 'hasActivePublicProfile',
+          'instagramUrl', 'facebookUrl', 'googlePlaceId', 'googleMapsUrl',
+          'rating', 'reviewCount', 'leadScore', 'source',
+          'verificationStatus', 'lastVerifiedAt', 'status', 'notes',
+          'tags', 'lastContactedAt', 'nextFollowUpAt', 'aiResearchJson',
+          'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isValidId(leadId) && existing().userId == request.auth.uid;
+    }
+
+    // Collection 3: /messages/{messageId}
+    match /messages/{messageId} {
+      allow get: if isSignedIn() && isValidId(messageId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(messageId) &&
+        isValidMessage(incoming()) &&
+        exists(/databases/$(database)/documents/leads/$(incoming().leadId)) &&
+        get(/databases/$(database)/documents/leads/$(incoming().leadId)).data.userId == request.auth.uid &&
+        get(/databases/$(database)/documents/leads/$(incoming().leadId)).data.status != 'opted_out';
+      allow update: if isSignedIn() && isValidId(messageId) &&
+        isValidMessage(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().leadId == existing().leadId &&
+        incoming().createdAt == existing().createdAt &&
+        !(existing().status == 'opted_out' && incoming().status != 'opted_out') &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'leadBusinessName', 'platform', 'messageBody', 'language',
+          'tone', 'status', 'approvedAt', 'sentAt', 'replyNotes', 'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isValidId(messageId) && existing().userId == request.auth.uid;
+    }
+
+    // Collection 4: /activities/{activityId}
+    match /activities/{activityId} {
+      allow get: if isSignedIn() && isValidId(activityId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(activityId) &&
+        isValidActivity(incoming()) &&
+        exists(/databases/$(database)/documents/leads/$(incoming().leadId)) &&
+        get(/databases/$(database)/documents/leads/$(incoming().leadId)).data.userId == request.auth.uid;
+      allow update: if false;
+      allow delete: if isSignedIn() && isValidId(activityId) && existing().userId == request.auth.uid;
+    }
+
+    // Collection 5: /followups/{followupId}
+    match /followups/{followupId} {
+      allow get: if isSignedIn() && isValidId(followupId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(followupId) &&
+        isValidFollowup(incoming()) &&
+        exists(/databases/$(database)/documents/leads/$(incoming().leadId)) &&
+        get(/databases/$(database)/documents/leads/$(incoming().leadId)).data.userId == request.auth.uid;
+      allow update: if isSignedIn() && isValidId(followupId) &&
+        isValidFollowup(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().leadId == existing().leadId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'leadBusinessName', 'scheduledAt', 'status', 'notes', 'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isValidId(followupId) && existing().userId == request.auth.uid;
+    }
+
+    // Collection 6: /integrations/{integrationId}
+    match /integrations/{integrationId} {
+      allow get: if isSignedIn() && isValidId(integrationId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(integrationId) && isValidIntegration(incoming());
+      allow update: if isSignedIn() && isValidId(integrationId) &&
+        isValidIntegration(incoming()) &&
+        existing().userId == request.auth.uid &&
+        incoming().userId == existing().userId &&
+        incoming().provider == existing().provider &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'connectionStatus', 'notes', 'updatedAt'
+        ]);
+      allow delete: if isSignedIn() && isValidId(integrationId) && existing().userId == request.auth.uid;
+    }
+  }
+}
