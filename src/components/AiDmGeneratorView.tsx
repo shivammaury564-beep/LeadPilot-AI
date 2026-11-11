@@ -18,6 +18,7 @@ import {
   MessageStyle,
   OutreachPlatform,
 } from '../types/leadpilot';
+import { safeParseHttpResponse } from '../utils/scoringAndCrm';
 import { authenticatedFetch } from '../lib/supabase';
 
 interface AiDmGeneratorViewProps {
@@ -99,10 +100,15 @@ export const AiDmGeneratorView: React.FC<AiDmGeneratorViewProps> = ({
           agencyName: agencyName || 'Northstar Web Studio',
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || 'Failed to generate messages.');
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        res,
+        'Gemini AI DM Generator'
+      );
+      if (!parsed.ok || !parsed.data) {
+        throw new Error(parsed.errorMessage || 'Failed to generate messages.');
+      }
 
-      const list: string[] = Array.isArray(data.variations) ? data.variations : [];
+      const list: string[] = Array.isArray(parsed.data.variations) ? parsed.data.variations : [];
       setVariations(list);
       setSelectedVariationIdx(0);
       setEditorText(list[0] || '');

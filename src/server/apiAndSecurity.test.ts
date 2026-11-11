@@ -306,8 +306,219 @@ test('Authentication, Cross-User Data Isolation (RLS), Duplicate Detection, and 
     const badDecData = await badDecRes.json();
     assert.equal(badDecData.ok, false);
     assert.equal(badDecData.code, 'DECRYPTION_FAILED');
+
+    // 14. Unmatched /api/* route returns structured JSON 404 instead of plain text "The page could not be found"
+    const unknownApiRes = await fetch(`${baseUrl}/api/unknown-nonexistent-route`, {
+      method: 'POST',
+      headers: headersA,
+    });
+    assert.equal(unknownApiRes.status, 404);
+    assert.ok((unknownApiRes.headers.get('content-type') || '').includes('application/json'));
+    const unknownApiData = await unknownApiRes.json();
+    assert.equal(unknownApiData.code, 'API_ROUTE_NOT_FOUND');
   } finally {
     await close();
   }
 });
+
+test('Google Places API (New) Discovery Engine: Single query, Pagination, Invalid API key, Disabled API, Quota exceeded, and Empty results', async () => {
+  const { executeGooglePlacesTextSearch } = await import('../../server');
+
+  // 1. Single search query + Place Details verification
+  const singleRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      state: 'Maharashtra',
+      country: 'India',
+      category: 'Premium salons',
+      minRating: 4.0,
+      minReviews: 5,
+      maxResults: 20,
+      verifyMissingWebsites: true,
+    },
+    {
+      apiKey: 'TEST_VALID_KEY',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('places:searchText')) {
+          return new Response(
+            JSON.stringify({
+              places: [
+                {
+                  id: 'ChIJ_salon_with_web',
+                  displayName: { text: 'Athenian Salon Mumbai' },
+                  formattedAddress: 'Ghatkopar East, Mumbai',
+                  websiteUri: 'https://atheniansalon.com',
+                  rating: 4.8,
+                  userRatingCount: 180,
+                  internationalPhoneNumber: '+91 93210 16619',
+                  businessStatus: 'OPERATIONAL',
+                },
+                {
+                  id: 'ChIJ_salon_no_web_verified',
+                  displayName: { text: 'Velvet Bridal Hair Studio' },
+                  formattedAddress: 'Bandra West, Mumbai',
+                  rating: 4.7,
+                  userRatingCount: 74,
+                  internationalPhoneNumber: '+91 98201 44556',
+                  businessStatus: 'OPERATIONAL',
+                },
+                {
+                  id: 'ChIJ_salon_unverified_no_phone',
+                  displayName: { text: 'Local Hair Corner' },
+                  formattedAddress: 'Andheri East, Mumbai',
+                  rating: 4.4,
+                  userRatingCount: 19,
+                  businessStatus: 'OPERATIONAL',
+                },
+              ],
+              nextPageToken: 'token_page_2_abc',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        // Place Details verification call
+        if (url.includes('ChIJ_salon_no_web_verified')) {
+          return new Response(
+            JSON.stringify({
+              id: 'ChIJ_salon_no_web_verified',
+              displayName: { text: 'Velvet Bridal Hair Studio' },
+              formattedAddress: 'Bandra West, Mumbai',
+              internationalPhoneNumber: '+91 98201 44556',
+              businessStatus: 'OPERATIONAL',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            id: 'ChIJ_salon_unverified_no_phone',
+            displayName: { text: 'Local Hair Corner' },
+            formattedAddress: 'Andheri East, Mumbai',
+            businessStatus: 'OPERATIONAL',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }) as typeof fetch,
+    }
+  );
+
+  assert.equal(singleRes.httpStatus, 200);
+  assert.equal(singleRes.body.places.length, 3);
+  assert.equal(singleRes.body.nextPageToken, 'token_page_2_abc');
+  assert.equal(singleRes.body.places[0].websiteStatus, 'modern_verified');
+  assert.equal(singleRes.body.places[1].websiteStatus, 'missing_verified');
+  assert.equal(singleRes.body.places[2].websiteStatus, 'unverified');
+
+  // 2. Pagination: Invalid/expired nextPageToken gracefully resolves as pageTokenExhausted (200 OK, empty places)
+  const expiredPageRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      category: 'Premium salons',
+      pageToken: 'expired_token_xyz',
+    },
+    {
+      apiKey: 'TEST_VALID_KEY',
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 400,
+              message: 'Request contains an invalid argument.',
+              status: 'INVALID_ARGUMENT',
+            },
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )) as typeof fetch,
+    }
+  );
+  assert.equal(expiredPageRes.httpStatus, 200);
+  assert.equal(expiredPageRes.body.pageTokenExhausted, true);
+  assert.equal(expiredPageRes.body.places.length, 0);
+
+  // 3. Invalid API key (Real Google Places API call with invalid key)
+  const realInvalidKeyRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      category: 'Premium salons',
+    },
+    {
+      apiKey: 'AIzaSy_INVALID_TEST_KEY_0000000000',
+    }
+  );
+  assert.equal(realInvalidKeyRes.httpStatus, 403);
+  assert.equal(realInvalidKeyRes.body.invalidApiKey, true);
+  assert.ok(realInvalidKeyRes.body.error.toLowerCase().includes('api key'));
+
+  // 4. Disabled API (PERMISSION_DENIED / SERVICE_DISABLED)
+  const disabledApiRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      category: 'Premium salons',
+    },
+    {
+      apiKey: 'TEST_KEY',
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 403,
+              message:
+                'Places API (New) has not been used in project 123456 before or it is disabled.',
+              status: 'PERMISSION_DENIED',
+              details: [{ reason: 'SERVICE_DISABLED' }],
+            },
+          }),
+          { status: 403, headers: { 'Content-Type': 'application/json' } }
+        )) as typeof fetch,
+    }
+  );
+  assert.equal(disabledApiRes.httpStatus, 403);
+  assert.equal(disabledApiRes.body.apiDisabled, true);
+
+  // 5. Quota exceeded (429 RESOURCE_EXHAUSTED)
+  const quotaRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      category: 'Premium salons',
+    },
+    {
+      apiKey: 'TEST_KEY',
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 429,
+              message: 'Quota exceeded for quota metric TextSearch requests.',
+              status: 'RESOURCE_EXHAUSTED',
+            },
+          }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        )) as typeof fetch,
+    }
+  );
+  assert.equal(quotaRes.httpStatus, 429);
+  assert.equal(quotaRes.body.quotaExceeded, true);
+
+  // 6. Empty results
+  const emptyRes = await executeGooglePlacesTextSearch(
+    {
+      city: 'Mumbai',
+      category: 'Premium salons',
+      customQuery: 'zzzxxyyynonexistentbusiness999888777',
+    },
+    {
+      apiKey: 'TEST_KEY',
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof fetch,
+    }
+  );
+  assert.equal(emptyRes.httpStatus, 200);
+  assert.deepEqual(emptyRes.body.places, []);
+  assert.equal(emptyRes.body.nextPageToken, '');
+});
+
 

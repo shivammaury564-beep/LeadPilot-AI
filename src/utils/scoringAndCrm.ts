@@ -792,9 +792,184 @@ export function matchesWebsiteFilterGroup(
   return status === filter;
 }
 
+export interface SafeHttpJsonResult<T = Record<string, any>> {
+  ok: boolean;
+  status: number;
+  contentType: string;
+  isJson: boolean;
+  data: T | null;
+  rawTextPreview: string;
+  errorMessage: string | null;
+  isNotFoundPage: boolean;
+  isQuotaExceeded: boolean;
+  isInvalidApiKey: boolean;
+  isApiDisabled: boolean;
+}
+
+/**
+ * Safely reads an HTTP Response without blindly calling response.json().
+ * 1. Reads raw text safely.
+ * 2. Checks HTTP status and Content-Type header.
+ * 3. Parses JSON only when appropriate inside try/catch.
+ * 4. Handles plain-text (e.g. "The page could not be found") and HTML error responses cleanly.
+ * 5. Classifies Google Places / backend errors into actionable messages without exposing secrets.
+ */
+export async function safeParseHttpResponse<T = Record<string, any>>(
+  response: Response,
+  contextLabel = 'API'
+): Promise<SafeHttpJsonResult<T>> {
+  const status = response.status;
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+  let rawText = '';
+  try {
+    rawText = await response.text();
+  } catch (readErr: any) {
+    return {
+      ok: false,
+      status,
+      contentType,
+      isJson: false,
+      data: null,
+      rawTextPreview: '',
+      errorMessage: `Failed to read response body from ${contextLabel} (HTTP ${status}): ${
+        readErr?.message || 'Read error'
+      }`,
+      isNotFoundPage: status === 404,
+      isQuotaExceeded: status === 429,
+      isInvalidApiKey: status === 401 || status === 403,
+      isApiDisabled: false,
+    };
+  }
+
+  const trimmed = rawText.trim();
+  const rawTextPreview = trimmed.slice(0, 240);
+  const looksLikeJson =
+    contentType.includes('application/json') ||
+    contentType.includes('+json') ||
+    trimmed.startsWith('{') ||
+    trimmed.startsWith('[');
+  const looksLikeHtml =
+    contentType.includes('text/html') ||
+    /^<!doctype\s+html/i.test(trimmed) ||
+    /^<html/i.test(trimmed);
+  const isPlainNotFound =
+    status === 404 ||
+    /^the page could not be found/i.test(trimmed) ||
+    /\bNOT_FOUND\b/.test(trimmed);
+
+  let parsedData: T | null = null;
+  let isJson = false;
+
+  if (trimmed.length > 0 && looksLikeJson && !looksLikeHtml) {
+    try {
+      parsedData = JSON.parse(trimmed) as T;
+      isJson = true;
+    } catch {
+      isJson = false;
+      parsedData = null;
+    }
+  }
+
+  const anyData = parsedData as Record<string, any> | null;
+  const upstreamErrorObj =
+    anyData && typeof anyData.error === 'object' && anyData.error !== null
+      ? anyData.error
+      : null;
+  const upstreamErrorMessage =
+    typeof anyData?.error === 'string'
+      ? anyData.error
+      : typeof upstreamErrorObj?.message === 'string'
+      ? upstreamErrorObj.message
+      : typeof anyData?.message === 'string'
+      ? anyData.message
+      : '';
+  const upstreamStatus =
+    typeof upstreamErrorObj?.status === 'string' ? upstreamErrorObj.status : '';
+  const upstreamReason =
+    Array.isArray(upstreamErrorObj?.details) &&
+    typeof upstreamErrorObj.details[0]?.reason === 'string'
+      ? upstreamErrorObj.details[0].reason
+      : '';
+
+  const isQuotaExceeded =
+    status === 429 ||
+    upstreamStatus === 'RESOURCE_EXHAUSTED' ||
+    Boolean(anyData?.quotaExceeded) ||
+    /quota|rate\s*limit|too many requests/i.test(upstreamErrorMessage || rawTextPreview);
+
+  const isInvalidApiKey =
+    Boolean(anyData?.invalidApiKey) ||
+    upstreamReason === 'API_KEY_INVALID' ||
+    /api key not valid|invalid api key|key is invalid/i.test(upstreamErrorMessage);
+
+  const isApiDisabled =
+    Boolean(anyData?.apiDisabled) ||
+    upstreamReason === 'SERVICE_DISABLED' ||
+    /has not been used in project|is disabled|enable it by visiting|places api \(new\) has not been/i.test(
+      upstreamErrorMessage
+    );
+
+  if (response.ok && isJson) {
+    return {
+      ok: true,
+      status,
+      contentType,
+      isJson: true,
+      data: parsedData,
+      rawTextPreview,
+      errorMessage: null,
+      isNotFoundPage: false,
+      isQuotaExceeded: false,
+      isInvalidApiKey: false,
+      isApiDisabled: false,
+    };
+  }
+
+  let errorMessage = upstreamErrorMessage;
+  if (!errorMessage) {
+    if (isQuotaExceeded) {
+      errorMessage = `Google Maps Platform quota or rate limit exceeded (HTTP ${status}).`;
+    } else if (isInvalidApiKey) {
+      errorMessage = 'Google Maps Platform API key is invalid. Please check your API key configuration.';
+    } else if (isApiDisabled) {
+      errorMessage =
+        'Google Places API (New) is disabled for this project. Please enable Places API (New) in Google Cloud Console.';
+    } else if (isPlainNotFound) {
+      errorMessage = `${contextLabel} endpoint returned HTTP 404 (The page could not be found). Verify backend server route configuration.`;
+    } else if (looksLikeHtml) {
+      const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const cleanTitle = titleMatch ? titleMatch[1].trim() : `HTTP ${status}`;
+      errorMessage = `${contextLabel} returned an HTML error page (${cleanTitle}) instead of JSON.`;
+    } else if (trimmed.length > 0 && !isJson) {
+      const cleanSnippet = trimmed.replace(/\s+/g, ' ').slice(0, 140);
+      errorMessage = `${contextLabel} returned non-JSON response (HTTP ${status}): "${cleanSnippet}"`;
+    } else {
+      errorMessage = `${contextLabel} request failed with HTTP status ${status}.`;
+    }
+  }
+
+  return {
+    ok: false,
+    status,
+    contentType,
+    isJson,
+    data: parsedData,
+    rawTextPreview,
+    errorMessage,
+    isNotFoundPage: isPlainNotFound,
+    isQuotaExceeded,
+    isInvalidApiKey,
+    isApiDisabled,
+  };
+}
+
 /**
  * Independently verifies website status using Place Details (New) `websiteUri` FieldMask
  * and secondary domain/editorial signals before classifying as `No Website – Verified`.
+ * - If websiteUri exists -> Has Website ('modern_verified')
+ * - If websiteUri is missing -> Unverified – Needs Review ('unverified'), unless Place Details
+ *   independently confirms the operational business has verified contact details and no website ('missing_verified').
  */
 export function verifyPlaceDetailsWebsiteStatus(
   rawPlace: Record<string, any>,
@@ -833,12 +1008,22 @@ export function verifyPlaceDetailsWebsiteStatus(
   }
 
   // Never assume missing websiteUri in Text Search alone proves no website exists.
-  // Require both Place Details response AND independent verification check before marking 'missing_verified'.
+  // Require Place Details response + independent verification + operational status + verified contact phone.
   if (placeDetails && independentVerificationConfirmed) {
     const businessStatus = String(
       placeDetails.businessStatus || rawPlace?.businessStatus || 'OPERATIONAL'
     ).toUpperCase();
-    if (businessStatus === 'OPERATIONAL') {
+    const hasVerifiedPhone = Boolean(
+      (typeof placeDetails.internationalPhoneNumber === 'string' &&
+        placeDetails.internationalPhoneNumber.trim()) ||
+        (typeof placeDetails.nationalPhoneNumber === 'string' &&
+          placeDetails.nationalPhoneNumber.trim()) ||
+        (typeof rawPlace?.internationalPhoneNumber === 'string' &&
+          rawPlace.internationalPhoneNumber.trim()) ||
+        (typeof rawPlace?.nationalPhoneNumber === 'string' &&
+          rawPlace.nationalPhoneNumber.trim())
+    );
+    if (businessStatus === 'OPERATIONAL' && hasVerifiedPhone) {
       return {
         websiteUrl: '',
         websiteStatus: 'missing_verified',

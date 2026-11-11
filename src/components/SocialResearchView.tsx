@@ -14,7 +14,7 @@ import {
   LeadRecord,
   WebsiteStatus,
 } from '../types/leadpilot';
-import { calculateLeadScore } from '../utils/scoringAndCrm';
+import { calculateLeadScore, safeParseHttpResponse } from '../utils/scoringAndCrm';
 import { authenticatedFetch } from '../lib/supabase';
 
 interface SocialResearchViewProps {
@@ -199,10 +199,15 @@ export const SocialResearchView: React.FC<SocialResearchViewProps> = ({
           notes: notes.trim(),
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.error || 'AI Research failed.');
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        res,
+        'Gemini AI Business Research'
+      );
+      if (!parsed.ok || !parsed.data?.research) {
+        throw new Error(parsed.errorMessage || 'AI Research failed.');
+      }
 
-      const summary: AIResearchSummary = data.research;
+      const summary: AIResearchSummary = parsed.data.research;
       setAiResearch(summary);
 
       // Persist research automatically if lead is saved or save it now

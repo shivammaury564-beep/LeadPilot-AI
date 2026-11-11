@@ -350,3 +350,32 @@ test('Place Details verification and Website Filter strictly distinguish No Webs
   assert.equal(matchesWebsiteFilterGroup(hasWeb, 'missing_verified'), false);
 });
 
+test('safeParseHttpResponse safely handles plain-text "The page could not be found" and HTML errors without throwing JSON SyntaxError', async () => {
+  const { safeParseHttpResponse } = await import('./scoringAndCrm');
+
+  // 1. Plain-text 404 ("The page could not be found") — exact root cause of Unexpected token 'T', "The page c"...
+  const plain404Res = new Response('The page could not be found\n\nNOT_FOUND', {
+    status: 404,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+  });
+  const parsed404 = await safeParseHttpResponse(plain404Res, 'Google Places Search API');
+  assert.equal(parsed404.ok, false);
+  assert.equal(parsed404.isJson, false);
+  assert.equal(parsed404.isNotFoundPage, true);
+  assert.ok(parsed404.errorMessage?.includes('404'));
+
+  // 2. HTML 502 Bad Gateway response
+  const html502Res = new Response(
+    '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>Gateway Error</body></html>',
+    {
+      status: 502,
+      headers: { 'Content-Type': 'text/html' },
+    }
+  );
+  const parsed502 = await safeParseHttpResponse(html502Res, 'Places Upstream');
+  assert.equal(parsed502.ok, false);
+  assert.equal(parsed502.isJson, false);
+  assert.ok(parsed502.errorMessage?.includes('502 Bad Gateway'));
+});
+
+

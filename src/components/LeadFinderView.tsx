@@ -29,6 +29,8 @@ import {
   detectDuplicateLead,
   matchesWebsiteFilterGroup,
   normalizeGooglePlaceId,
+  safeParseHttpResponse,
+  validateAndNormalizePlaceRecord,
   WebsiteFilterOption,
 } from '../utils/scoringAndCrm';
 import { authenticatedFetch } from '../lib/supabase';
@@ -92,7 +94,20 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
   const [selectedMarkerIdx, setSelectedMarkerIdx] = useState<number | null>(null);
   const [inspectingPlace, setInspectingPlace] = useState<Record<string, any> | null>(null);
   const [loadingDetailsId, setLoadingDetailsId] = useState<string | null>(null);
-  const [telemetry, setTelemetry] = useState<DiscoveryTelemetry | null>(null);
+  const [telemetry, setTelemetry] = useState<DiscoveryTelemetry>({
+    isRunning: false,
+    cancelled: false,
+    currentQueryIndex: 0,
+    totalQueriesPlanned: 5,
+    currentQueryText: 'Ready to run multi-query discovery',
+    pagesFetched: 0,
+    totalDiscovered: 0,
+    withWebsiteCount: 0,
+    verifiedNoWebsiteCount: 0,
+    needsVerificationCount: 0,
+    duplicatesRemovedCount: 0,
+    qualifiedSavedCount: 0,
+  });
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -142,6 +157,255 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
     };
   };
 
+  const fetchDirectPlaceDetailsBrowser = async (
+    placeId: string,
+    apiKey: string,
+    signal?: AbortSignal
+  ): Promise<Record<string, any> | null> => {
+    const cleanId = normalizeGooglePlaceId(placeId);
+    if (!cleanId || !apiKey) return null;
+    const fields = [
+      'id',
+      'displayName',
+      'formattedAddress',
+      'googleMapsUri',
+      'rating',
+      'userRatingCount',
+      'websiteUri',
+      'internationalPhoneNumber',
+      'nationalPhoneNumber',
+      'businessStatus',
+      'location',
+      'editorialSummary',
+    ].join(',');
+    try {
+      const res = await fetch(
+        `https://places.googleapis.com/v1/places/${encodeURIComponent(cleanId)}`,
+        {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            'X-Goog-FieldMask': fields,
+            'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
+          },
+          signal,
+        }
+      );
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        res,
+        'Google Place Details (New)'
+      );
+      if (parsed.ok && parsed.data && typeof parsed.data.id === 'string') {
+        return parsed.data;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const requestPlacesSearchTextPage = async (
+    payload: {
+      city: string;
+      state: string;
+      country: string;
+      category: string;
+      keyword?: string;
+      customQuery?: string;
+      minRating: number;
+      minReviews: number;
+      maxResults: number;
+      pageToken: string;
+      verifyMissingWebsites: boolean;
+    },
+    signal: AbortSignal
+  ): Promise<{
+    ok: boolean;
+    quotaExceeded: boolean;
+    pageTokenExhausted?: boolean;
+    places: Array<Partial<LeadRecord> & { leadScore: number }>;
+    nextPageToken: string;
+    errorMessage?: string;
+  }> => {
+    const res = await authenticatedFetch('/api/places/search-text', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+    const parsed = await safeParseHttpResponse<Record<string, any>>(
+      res,
+      'Google Places Text Search API'
+    );
+
+    // If /api/places/search-text returned a 404 plain-text page (e.g. "The page could not be found" on static hosting)
+    // and a browser Maps key is available, execute the official Places API (New) Text Search directly.
+    if (parsed.isNotFoundPage && mapsBrowserKey.trim()) {
+      const locationParts = [payload.city, payload.state, payload.country]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join(', ');
+      const textQuery =
+        payload.customQuery?.trim() ||
+        (locationParts
+          ? `${payload.keyword?.trim() || payload.category} in ${locationParts}`
+          : payload.keyword?.trim() || payload.category);
+
+      const directBody: Record<string, unknown> = {
+        textQuery,
+        pageSize: Math.min(20, Math.max(1, payload.maxResults || 20)),
+      };
+      if (payload.minRating > 0) {
+        directBody.minRating = Math.min(5, Math.max(0, payload.minRating));
+      }
+      if (payload.pageToken.trim()) {
+        directBody.pageToken = payload.pageToken.trim();
+      }
+
+      const fieldMask = [
+        'places.id',
+        'places.displayName',
+        'places.formattedAddress',
+        'places.googleMapsUri',
+        'places.rating',
+        'places.userRatingCount',
+        'places.websiteUri',
+        'places.internationalPhoneNumber',
+        'places.nationalPhoneNumber',
+        'places.businessStatus',
+        'places.location',
+        'places.primaryTypeDisplayName',
+        'nextPageToken',
+      ].join(',');
+
+      const directRes = await fetch('https://places.googleapis.com/v1/places:searchText', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': mapsBrowserKey.trim(),
+          'X-Goog-FieldMask': fieldMask,
+          'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
+        },
+        body: JSON.stringify(directBody),
+        signal,
+      });
+
+      const directParsed = await safeParseHttpResponse<Record<string, any>>(
+        directRes,
+        'Google Places API (New)'
+      );
+
+      if (directParsed.isQuotaExceeded) {
+        return {
+          ok: false,
+          quotaExceeded: true,
+          places: [],
+          nextPageToken: '',
+          errorMessage: directParsed.errorMessage || 'Google Maps Platform quota reached.',
+        };
+      }
+
+      if (!directParsed.ok) {
+        if (payload.pageToken && directParsed.status === 400) {
+          return {
+            ok: true,
+            quotaExceeded: false,
+            pageTokenExhausted: true,
+            places: [],
+            nextPageToken: '',
+          };
+        }
+        return {
+          ok: false,
+          quotaExceeded: false,
+          places: [],
+          nextPageToken: '',
+          errorMessage:
+            directParsed.errorMessage || 'Failed to query Google Places Text Search (New).',
+        };
+      }
+
+      const rawPlaces: Record<string, any>[] = Array.isArray(directParsed.data?.places)
+        ? directParsed.data!.places
+        : [];
+      const detailsMap = new Map<string, Record<string, any>>();
+      if (payload.verifyMissingWebsites && rawPlaces.length > 0) {
+        const candidates = rawPlaces.filter((p) => {
+          const hasWeb =
+            typeof p?.websiteUri === 'string' && /^https?:\/\/.+/i.test(p.websiteUri.trim());
+          return !hasWeb;
+        });
+        const batchDetails = await Promise.all(
+          candidates.map(async (p) => {
+            const pid = typeof p?.id === 'string' ? p.id : '';
+            if (!pid) return null;
+            const det = await fetchDirectPlaceDetailsBrowser(pid, mapsBrowserKey.trim(), signal);
+            return det ? { pid, det } : null;
+          })
+        );
+        for (const item of batchDetails) {
+          if (item) detailsMap.set(item.pid, item.det);
+        }
+      }
+
+      const normalized = rawPlaces
+        .map((p) => {
+          const pid = typeof p?.id === 'string' ? p.id : '';
+          const det = pid ? detailsMap.get(pid) || null : null;
+          return validateAndNormalizePlaceRecord(p, {
+            city: payload.city,
+            state: payload.state,
+            country: payload.country,
+            category: payload.category,
+            placeDetails: det,
+            independentVerificationConfirmed: Boolean(det),
+          });
+        })
+        .filter((x): x is NonNullable<typeof x> => Boolean(x));
+
+      return {
+        ok: true,
+        quotaExceeded: false,
+        places: normalized,
+        nextPageToken:
+          typeof directParsed.data?.nextPageToken === 'string'
+            ? directParsed.data.nextPageToken
+            : '',
+      };
+    }
+
+    if (parsed.isQuotaExceeded || parsed.status === 429) {
+      return {
+        ok: false,
+        quotaExceeded: true,
+        places: [],
+        nextPageToken: '',
+        errorMessage: parsed.errorMessage || 'Google Maps Platform quota reached.',
+      };
+    }
+
+    if (!parsed.ok || !parsed.data) {
+      return {
+        ok: false,
+        quotaExceeded: false,
+        places: [],
+        nextPageToken: '',
+        errorMessage:
+          parsed.errorMessage || 'Failed to search Google Places Text Search API.',
+      };
+    }
+
+    return {
+      ok: true,
+      quotaExceeded: false,
+      pageTokenExhausted: Boolean(parsed.data.pageTokenExhausted),
+      places: Array.isArray(parsed.data.places) ? parsed.data.places : [],
+      nextPageToken:
+        typeof parsed.data.nextPageToken === 'string' ? parsed.data.nextPageToken : '',
+    };
+  };
+
   const handleRunSearch = async (e?: React.FormEvent, manualPageToken = '') => {
     if (e) e.preventDefault();
 
@@ -184,26 +448,43 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
           }),
           signal: controller.signal,
         });
-        const data = await res.json();
+        const parsedNearby = await safeParseHttpResponse<Record<string, any>>(
+          res,
+          'Google Places Nearby Search API'
+        );
 
-        if (res.status === 429 || data?.quotaExceeded) {
+        if (parsedNearby.isQuotaExceeded || parsedNearby.status === 429) {
           window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
           setFeedback({
             type: 'error',
-            text: data?.error || 'Google Maps Platform quota reached.',
+            text: parsedNearby.errorMessage || 'Google Maps Platform quota reached.',
           });
           setLoading(false);
           return;
         }
-        if (!res.ok) {
-          throw new Error(data?.error || 'Failed to search Google Places Nearby.');
+        if (!parsedNearby.ok || !parsedNearby.data) {
+          throw new Error(
+            parsedNearby.errorMessage || 'Failed to search Google Places Nearby.'
+          );
         }
 
-        const fetched: Array<Partial<LeadRecord> & { leadScore: number }> = Array.isArray(data.places)
-          ? data.places
+        const fetched: Array<Partial<LeadRecord> & { leadScore: number }> = Array.isArray(
+          parsedNearby.data.places
+        )
+          ? parsedNearby.data.places
           : [];
         setResults(fetched);
         setNextPageToken('');
+        setTelemetry(
+          computeTelemetryCounts(fetched, 0, 0, {
+            isRunning: false,
+            cancelled: false,
+            currentQueryIndex: 1,
+            totalQueriesPlanned: 1,
+            currentQueryText: `Nearby Search (${latitude.toFixed(3)}, ${longitude.toFixed(3)})`,
+            pagesFetched: 1,
+          })
+        );
         setFeedback({
           type: 'success',
           text: `Discovered ${fetched.length} nearby businesses via Google Places API (New).`,
@@ -214,9 +495,8 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
 
       // Manual single next-page fetch if triggered via "Load Next Page" button
       if (manualPageToken) {
-        const res = await authenticatedFetch('/api/places/search-text', {
-          method: 'POST',
-          body: JSON.stringify({
+        const pageRes = await requestPlacesSearchTextPage(
+          {
             city,
             state,
             country,
@@ -227,14 +507,22 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
             maxResults: 20,
             pageToken: manualPageToken,
             verifyMissingWebsites: true,
-          }),
-          signal: controller.signal,
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || 'Failed to fetch next page from Google Places.');
+          },
+          controller.signal
+        );
+        if (pageRes.quotaExceeded) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+          setFeedback({
+            type: 'error',
+            text: pageRes.errorMessage || 'Google Maps Platform quota reached.',
+          });
+          setLoading(false);
+          return;
         }
-        const fetched = Array.isArray(data.places) ? data.places : [];
+        if (!pageRes.ok) {
+          throw new Error(pageRes.errorMessage || 'Failed to fetch next page from Google Places.');
+        }
+        const fetched = pageRes.places;
         const existingPlaceIds = new Set(
           results.map((r) => normalizeGooglePlaceId(r.googlePlaceId)).filter(Boolean)
         );
@@ -244,7 +532,7 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
         });
         const combined = [...results, ...dedupedNew];
         setResults(combined);
-        setNextPageToken(data.nextPageToken || '');
+        setNextPageToken(pageRes.nextPageToken || '');
         setLoading(false);
         return;
       }
@@ -308,7 +596,7 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
             if (controller.signal.aborted) break outerLoop;
           }
 
-          setTelemetry((prev) =>
+          setTelemetry(
             computeTelemetryCounts(accumulated, duplicatesRemoved, qualifiedSaved, {
               isRunning: true,
               cancelled: false,
@@ -319,9 +607,8 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
             })
           );
 
-          const res = await authenticatedFetch('/api/places/search-text', {
-            method: 'POST',
-            body: JSON.stringify({
+          const pageResult = await requestPlacesSearchTextPage(
+            {
               city,
               state,
               country,
@@ -332,35 +619,33 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
               maxResults: 20,
               pageToken: currentPageToken,
               verifyMissingWebsites: true,
-            }),
-            signal: controller.signal,
-          });
+            },
+            controller.signal
+          );
 
-          const data = await res.json();
-
-          if (res.status === 429 || data?.quotaExceeded) {
+          if (pageResult.quotaExceeded) {
             window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
             setFeedback({
               type: 'error',
-              text: data?.error || 'Google Maps Platform quota reached.',
+              text: pageResult.errorMessage || 'Google Maps Platform quota reached.',
             });
             break outerLoop;
           }
 
-          if (!res.ok) {
-            // If a secondary page token or sub-query fails, log and continue to next query if we already have results
+          if (!pageResult.ok) {
+            // If a secondary page token or sub-query fails after we already have results, advance cleanly
             if (accumulated.length > 0) {
               break;
             }
-            throw new Error(data?.error || 'Failed to search Google Places.');
+            throw new Error(pageResult.errorMessage || 'Failed to search Google Places.');
+          }
+
+          if (pageResult.pageTokenExhausted) {
+            break;
           }
 
           pagesFetched += 1;
-          const pagePlaces: Array<Partial<LeadRecord> & { leadScore: number }> = Array.isArray(
-            data.places
-          )
-            ? data.places
-            : [];
+          const pagePlaces = pageResult.places;
 
           const newlyEligibleToSave: Array<Partial<LeadRecord> & { leadScore: number }> = [];
 
@@ -408,7 +693,7 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
           }
 
           setResults([...accumulated]);
-          lastNextPageToken = typeof data.nextPageToken === 'string' ? data.nextPageToken : '';
+          lastNextPageToken = pageResult.nextPageToken || '';
           setNextPageToken(lastNextPageToken);
 
           setTelemetry(
@@ -448,8 +733,8 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
       setFeedback({
         type: wasCancelled ? 'info' : 'success',
         text: wasCancelled
-          ? `Discovery stopped: ${finalTelemetry.totalDiscovered} unique businesses discovered (${finalTelemetry.verifiedNoWebsiteCount} verified no-website, ${finalTelemetry.qualifiedSavedCount} saved to CRM).`
-          : `Discovery complete across ${pagesFetched} page(s): ${finalTelemetry.totalDiscovered} unique businesses found, ${finalTelemetry.verifiedNoWebsiteCount} verified without a website, ${finalTelemetry.duplicatesRemovedCount} duplicates removed, and ${finalTelemetry.qualifiedSavedCount} qualified leads saved to Supabase CRM.`,
+          ? `Discovery stopped: ${finalTelemetry.totalDiscovered} unique businesses discovered (${finalTelemetry.verifiedNoWebsiteCount} verified no-website, ${finalTelemetry.needsVerificationCount} unverified, ${finalTelemetry.qualifiedSavedCount} saved to CRM).`
+          : `Discovery complete across ${pagesFetched} page(s): ${finalTelemetry.totalDiscovered} unique businesses found (${finalTelemetry.withWebsiteCount} with websites, ${finalTelemetry.verifiedNoWebsiteCount} verified no-website, ${finalTelemetry.needsVerificationCount} unverified), ${finalTelemetry.duplicatesRemovedCount} duplicates removed, and ${finalTelemetry.qualifiedSavedCount} qualified leads saved to Supabase CRM.`,
       });
     } catch (err: any) {
       if (err?.name === 'AbortError') {
@@ -463,9 +748,11 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
           text: err.message || 'Google Places API search failed.',
         });
       }
-      setTelemetry((prev) =>
-        prev ? { ...prev, isRunning: false, cancelled: err?.name === 'AbortError' } : null
-      );
+      setTelemetry((prev) => ({
+        ...prev,
+        isRunning: false,
+        cancelled: err?.name === 'AbortError',
+      }));
     } finally {
       setLoading(false);
     }
@@ -476,39 +763,83 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
     setLoadingDetailsId(placeId);
     try {
       const res = await authenticatedFetch(`/api/places/details/${encodeURIComponent(placeId)}`);
-      const data = await res.json();
-      if (res.status === 429 || data?.quotaExceeded) {
-        window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
-        setFeedback({ type: 'error', text: 'Google Maps Platform quota reached.' });
-        return;
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        res,
+        'Google Place Details API'
+      );
+
+      let placeData: Record<string, any> | null = null;
+      if (parsed.isNotFoundPage && mapsBrowserKey.trim()) {
+        placeData = await fetchDirectPlaceDetailsBrowser(placeId, mapsBrowserKey.trim());
+      } else {
+        if (parsed.isQuotaExceeded || parsed.status === 429) {
+          window.dispatchEvent(new CustomEvent('gmp-quota-exceeded'));
+          setFeedback({ type: 'error', text: 'Google Maps Platform quota reached.' });
+          return;
+        }
+        if (!parsed.ok || !parsed.data?.place) {
+          throw new Error(parsed.errorMessage || 'Place details request failed.');
+        }
+        placeData = parsed.data.place;
       }
-      if (!res.ok) throw new Error(data?.error || 'Place details request failed.');
-      setInspectingPlace(data.place);
 
-      // Also update the item's verification status from authoritative Place Details
+      if (!placeData) {
+        throw new Error('Could not retrieve Place Details for this business.');
+      }
+
+      setInspectingPlace(placeData);
+
+      // Update the item's verification status from Place Details
       const hasDetailsWebsite =
-        typeof data.place?.websiteUri === 'string' &&
-        /^https?:\/\/.+/i.test(data.place.websiteUri.trim());
+        typeof placeData.websiteUri === 'string' &&
+        /^https?:\/\/.+/i.test(placeData.websiteUri.trim());
+      const hasDetailsPhone = Boolean(
+        (typeof placeData.internationalPhoneNumber === 'string' &&
+          placeData.internationalPhoneNumber.trim()) ||
+          (typeof placeData.nationalPhoneNumber === 'string' &&
+            placeData.nationalPhoneNumber.trim())
+      );
+      const isOperational =
+        String(placeData.businessStatus || 'OPERATIONAL').toUpperCase() === 'OPERATIONAL';
 
-      setResults((prev) =>
-        prev.map((item) => {
+      setResults((prev) => {
+        const nextList = prev.map((item) => {
           if (normalizeGooglePlaceId(item.googlePlaceId) !== normalizeGooglePlaceId(placeId)) {
             return item;
           }
           const nextWebsiteStatus: WebsiteStatus = hasDetailsWebsite
             ? 'modern_verified'
-            : 'missing_verified';
+            : isOperational && (hasDetailsPhone || Boolean(item.phone?.trim()))
+            ? 'missing_verified'
+            : 'unverified';
           const updated: Partial<LeadRecord> = {
             ...item,
-            websiteUrl: hasDetailsWebsite ? data.place.websiteUri.trim() : '',
+            websiteUrl: hasDetailsWebsite ? placeData!.websiteUri.trim() : '',
             websiteStatus: nextWebsiteStatus,
-            verificationStatus: 'verified',
+            verificationStatus: nextWebsiteStatus === 'unverified' ? 'needs_review' : 'verified',
             lastVerifiedAt: new Date().toISOString(),
           };
           const { totalScore } = calculateLeadScore(updated);
           return { ...updated, leadScore: totalScore };
-        })
-      );
+        });
+
+        setTelemetry((prevTel) =>
+          computeTelemetryCounts(
+            nextList,
+            prevTel.duplicatesRemovedCount,
+            prevTel.qualifiedSavedCount,
+            {
+              isRunning: prevTel.isRunning,
+              cancelled: prevTel.cancelled,
+              currentQueryIndex: prevTel.currentQueryIndex,
+              totalQueriesPlanned: prevTel.totalQueriesPlanned,
+              currentQueryText: prevTel.currentQueryText,
+              pagesFetched: prevTel.pagesFetched,
+            }
+          )
+        );
+        return nextList;
+      });
     } catch (err: any) {
       setFeedback({ type: 'error', text: err.message });
     } finally {
@@ -987,7 +1318,9 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
                     ? `Running Multi-Query Discovery (Query ${telemetry.currentQueryIndex} of ${telemetry.totalQueriesPlanned} · ${telemetry.pagesFetched} page(s) fetched)`
                     : telemetry.cancelled
                     ? `Discovery Stopped (${telemetry.pagesFetched} page(s) fetched)`
-                    : `Discovery Complete (${telemetry.pagesFetched} page(s) fetched across ${telemetry.totalQueriesPlanned} planned queries)`}
+                    : telemetry.pagesFetched > 0
+                    ? `Discovery Complete (${telemetry.pagesFetched} page(s) fetched across ${telemetry.totalQueriesPlanned} planned queries)`
+                    : `Discovery Telemetry Ready (${telemetry.totalQueriesPlanned} planned queries)`}
                 </span>
               </div>
               <span className="font-mono text-xs text-slate-400 truncate max-w-md">
@@ -1003,7 +1336,7 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
                   width: `${Math.min(
                     100,
                     Math.max(
-                      telemetry.isRunning ? 12 : 100,
+                      telemetry.isRunning ? 12 : telemetry.pagesFetched > 0 ? 100 : 0,
                       Math.round((telemetry.totalDiscovered / Math.max(1, maxResults)) * 100)
                     )
                   )}%`,
@@ -1027,17 +1360,17 @@ export const LeadFinderView: React.FC<LeadFinderViewProps> = ({
                 </div>
               </div>
 
-              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
-                <div className="text-[11px] text-emerald-300">No Website – Verified</div>
-                <div className="mt-0.5 font-mono text-base font-bold text-emerald-400 tabular-nums">
-                  {telemetry.verifiedNoWebsiteCount}
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5">
+                <div className="text-[11px] text-amber-300">Unverified</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-amber-400 tabular-nums">
+                  {telemetry.needsVerificationCount}
                 </div>
               </div>
 
-              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5">
-                <div className="text-[11px] text-amber-300">Needs Verification</div>
-                <div className="mt-0.5 font-mono text-base font-bold text-amber-400 tabular-nums">
-                  {telemetry.needsVerificationCount}
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2.5">
+                <div className="text-[11px] text-emerald-300">Verified No Website</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-emerald-400 tabular-nums">
+                  {telemetry.verifiedNoWebsiteCount}
                 </div>
               </div>
 

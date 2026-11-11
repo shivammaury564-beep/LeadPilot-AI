@@ -17,7 +17,7 @@ import {
   LeadStatus,
   UserProfile,
 } from '../types/leadpilot';
-import { generateCsvContent } from '../utils/scoringAndCrm';
+import { generateCsvContent, safeParseHttpResponse } from '../utils/scoringAndCrm';
 import { authenticatedFetch } from '../lib/supabase';
 
 interface ExportAndSettingsViewProps {
@@ -72,13 +72,17 @@ export const ExportAndSettingsView: React.FC<ExportAndSettingsViewProps> = ({
 
   useEffect(() => {
     authenticatedFetch('/api/integrations/status')
-      .then((r) => r.json())
-      .then((d) => setIntegrationStatus(d))
+      .then((r) => safeParseHttpResponse<Record<string, any>>(r, 'Integrations Status'))
+      .then((p) => {
+        if (p.ok && p.data) setIntegrationStatus(p.data);
+      })
       .catch(() => null);
 
     authenticatedFetch('/api/extension/manifest')
-      .then((r) => r.json())
-      .then((d) => setExtensionManifest(d))
+      .then((r) => safeParseHttpResponse<Record<string, any>>(r, 'Extension Manifest'))
+      .then((p) => {
+        if (p.ok && p.data) setExtensionManifest(p.data);
+      })
       .catch(() => null);
   }, []);
 
@@ -146,14 +150,17 @@ export const ExportAndSettingsView: React.FC<ExportAndSettingsViewProps> = ({
         notes: 'Captured via Chrome Extension Manifest V3 Side Panel API',
       }),
     });
-    const data = await res.json();
-    if (res.ok && data?.lead) {
-      await onSaveExtensionLead(data.lead, data.lead.id);
+    const parsed = await safeParseHttpResponse<Record<string, any>>(
+      res,
+      'Chrome Extension Capture'
+    );
+    if (parsed.ok && parsed.data?.lead) {
+      await onSaveExtensionLead(parsed.data.lead, parsed.data.lead.id);
       setExtSimFeedback(
-        `${data.message || 'Captured lead'} (Scored ${data.lead.leadScore}/100 via /api/extension/capture)`
+        `${parsed.data.message || 'Captured lead'} (Scored ${parsed.data.lead.leadScore}/100 via /api/extension/capture)`
       );
-    } else if (data?.error) {
-      setExtSimFeedback(data.error);
+    } else if (parsed.errorMessage) {
+      setExtSimFeedback(parsed.errorMessage);
     }
   };
 

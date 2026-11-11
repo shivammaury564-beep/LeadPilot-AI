@@ -11,6 +11,7 @@ import {
   generateCsvContent,
   isPremiumCategory,
   matchesWebsiteFilterGroup,
+  safeParseHttpResponse,
   validateAiDmVariationsJson,
   validateAiResearchJson,
   validateAndNormalizePlaceRecord,
@@ -442,10 +443,11 @@ app.get('/api/crm/export', requireAuth, async (req: AuthenticatedRequest, res: R
 // Helper: sleep for backoff / nextPageToken readiness
 const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Helper: Fetch Place Details (New) with retry handling to verify websiteUri
-async function fetchPlaceDetailsForVerification(
+// Helper: Fetch Place Details (New) with safe response parsing & timeout to verify websiteUri
+export async function fetchPlaceDetailsForVerification(
   placeId: string,
-  apiKey: string
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch
 ): Promise<Record<string, any> | null> {
   const cleanId = String(placeId || '').trim().replace(/^places\//i, '');
   if (!cleanId || !/^[a-zA-Z0-9_\-]+$/.test(cleanId)) return null;
@@ -470,7 +472,7 @@ async function fetchPlaceDetailsForVerification(
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       trackUsage('places');
-      const response = await fetch(url, {
+      const response = await fetchImpl(url, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -478,30 +480,341 @@ async function fetchPlaceDetailsForVerification(
           'X-Goog-FieldMask': fields,
           'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
         },
+        signal: AbortSignal.timeout(4000),
       });
 
-      if (response.status === 429) {
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        response,
+        'Google Places Details (New)'
+      );
+
+      if (parsed.isQuotaExceeded || parsed.status === 429) {
         return null;
       }
-      if (response.status >= 500 && attempt === 0) {
-        await sleepMs(400);
+      if (parsed.status >= 500 && attempt === 0) {
+        await sleepMs(350);
         continue;
       }
-      if (!response.ok) {
+      if (!parsed.ok || !parsed.data) {
         return null;
       }
-      const data = (await response.json()) as Record<string, any>;
-      if (data && typeof data.id === 'string') {
-        return data;
+      if (typeof parsed.data.id === 'string') {
+        return parsed.data;
       }
       return null;
     } catch {
       if (attempt === 0) {
-        await sleepMs(400);
+        await sleepMs(350);
       }
     }
   }
   return null;
+}
+
+export interface PlacesTextSearchInput {
+  city?: string;
+  state?: string;
+  country?: string;
+  category?: string;
+  keyword?: string;
+  customQuery?: string;
+  minRating?: number;
+  minReviews?: number;
+  maxResults?: number;
+  pageToken?: string;
+  verifyMissingWebsites?: boolean;
+}
+
+export async function executeGooglePlacesTextSearch(
+  input: PlacesTextSearchInput,
+  options: {
+    apiKey?: string;
+    fetchImpl?: typeof fetch;
+  } = {}
+): Promise<{
+  httpStatus: number;
+  body: Record<string, any>;
+}> {
+  const {
+    city = '',
+    state = '',
+    country = 'India',
+    category = 'Premium salons',
+    keyword = '',
+    customQuery = '',
+    minRating = 0,
+    minReviews = 0,
+    maxResults = 20,
+    pageToken = '',
+    verifyMissingWebsites = true,
+  } = input || {};
+
+  const cleanCity = typeof city === 'string' ? city.trim().slice(0, 100) : '';
+  const cleanState = typeof state === 'string' ? state.trim().slice(0, 100) : '';
+  const cleanCountry =
+    typeof country === 'string' && country.trim() ? country.trim().slice(0, 100) : 'India';
+  const cleanCategory =
+    typeof category === 'string' && category.trim()
+      ? category.trim().slice(0, 100)
+      : 'Premium salons';
+  const cleanKeyword = typeof keyword === 'string' ? keyword.trim().slice(0, 120) : '';
+  const cleanCustomQuery =
+    typeof customQuery === 'string' ? customQuery.trim().slice(0, 240) : '';
+
+  if (!cleanCity && !cleanKeyword && !cleanCustomQuery) {
+    return {
+      httpStatus: 400,
+      body: {
+        error: 'Please provide at least a City or Search Keyword.',
+      },
+    };
+  }
+
+  const apiKey = (options.apiKey !== undefined ? options.apiKey : getMapsApiKey()).trim();
+  const fetchImpl = options.fetchImpl || fetch;
+
+  if (!apiKey || apiKey === 'MY_GOOGLE_MAPS_API_KEY') {
+    return {
+      httpStatus: 503,
+      body: {
+        error:
+          'Google Maps Platform API key (GOOGLE_MAPS_PLATFORM_KEY) is not configured on the server.',
+        missingKey: true,
+      },
+    };
+  }
+
+  const locationParts = [cleanCity, cleanState, cleanCountry].filter(Boolean).join(', ');
+  const queryParts =
+    cleanCustomQuery ||
+    (locationParts
+      ? `${cleanKeyword || cleanCategory} in ${locationParts}`
+      : cleanKeyword || cleanCategory);
+
+  // Google Places Text Search (New) supports a maximum of 20 results per page.
+  // Never pretend one API request can return more than 20 results.
+  const pageSize = Math.min(20, Math.max(1, Number(maxResults) || 20));
+  const requestBody: Record<string, unknown> = {
+    textQuery: queryParts,
+    pageSize,
+  };
+
+  const parsedMinRating = Number(minRating);
+  if (Number.isFinite(parsedMinRating) && parsedMinRating > 0) {
+    requestBody.minRating = Math.min(5.0, Math.max(0, parsedMinRating));
+  }
+  const cleanPageToken =
+    typeof pageToken === 'string' ? pageToken.trim().slice(0, 4096) : '';
+  if (cleanPageToken) {
+    requestBody.pageToken = cleanPageToken;
+  }
+
+  const fieldMask = [
+    'places.id',
+    'places.displayName',
+    'places.formattedAddress',
+    'places.googleMapsUri',
+    'places.rating',
+    'places.userRatingCount',
+    'places.websiteUri',
+    'places.internationalPhoneNumber',
+    'places.nationalPhoneNumber',
+    'places.businessStatus',
+    'places.location',
+    'places.primaryTypeDisplayName',
+    'nextPageToken',
+  ].join(',');
+
+  let lastParsed = await (async () => {
+    let parsedResult: Awaited<ReturnType<typeof safeParseHttpResponse<Record<string, any>>>> | null =
+      null;
+
+    // Retry loop for transient 5xx errors or nextPageToken warm-up delay
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await sleepMs(attempt * 1200);
+      }
+      trackUsage('places');
+      let response: globalThis.Response;
+      try {
+        response = await fetchImpl('https://places.googleapis.com/v1/places:searchText', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Goog-Api-Key': apiKey,
+            'X-Goog-FieldMask': fieldMask,
+            'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
+          },
+          body: JSON.stringify(requestBody),
+          signal: AbortSignal.timeout(10000),
+        });
+      } catch (netErr: any) {
+        if (attempt < 2) continue;
+        return {
+          ok: false,
+          status: 504,
+          contentType: 'text/plain',
+          isJson: false,
+          data: null,
+          rawTextPreview: '',
+          errorMessage: `Network timeout or connection error reaching Google Places API (New): ${
+            netErr?.message || 'Timeout'
+          }`,
+          isNotFoundPage: false,
+          isQuotaExceeded: false,
+          isInvalidApiKey: false,
+          isApiDisabled: false,
+        };
+      }
+
+      parsedResult = await safeParseHttpResponse<Record<string, any>>(
+        response,
+        'Google Places Text Search (New)'
+      );
+
+      if (parsedResult.isQuotaExceeded || parsedResult.status === 429) {
+        break;
+      }
+
+      if (!parsedResult.isJson) {
+        if (attempt < 2 && parsedResult.status >= 500) continue;
+        break;
+      }
+
+      // If pageToken was just issued, Google Places may return 400 INVALID_ARGUMENT if queried <1.5s after token creation
+      if (cleanPageToken && parsedResult.status === 400 && attempt < 2) {
+        continue;
+      }
+      if (parsedResult.status >= 500 && attempt < 2) {
+        continue;
+      }
+      break;
+    }
+
+    return parsedResult!;
+  })();
+
+  if (lastParsed.isQuotaExceeded || lastParsed.status === 429) {
+    return {
+      httpStatus: 429,
+      body: {
+        error: lastParsed.errorMessage || 'Google Maps Platform quota reached.',
+        quotaExceeded: true,
+      },
+    };
+  }
+
+  if (lastParsed.isInvalidApiKey) {
+    return {
+      httpStatus: 403,
+      body: {
+        error:
+          lastParsed.errorMessage ||
+          'Google Maps Platform API key is invalid. Check GOOGLE_MAPS_PLATFORM_KEY.',
+        invalidApiKey: true,
+      },
+    };
+  }
+
+  if (lastParsed.isApiDisabled) {
+    return {
+      httpStatus: 403,
+      body: {
+        error:
+          lastParsed.errorMessage ||
+          'Google Places API (New) is not enabled in your Google Cloud project.',
+        apiDisabled: true,
+      },
+    };
+  }
+
+  if (!lastParsed.ok) {
+    if (cleanPageToken && lastParsed.status === 400) {
+      return {
+        httpStatus: 200,
+        body: {
+          places: [],
+          nextPageToken: '',
+          queryExecuted: queryParts,
+          verifiedDetailsCount: 0,
+          pageTokenExhausted: true,
+        },
+      };
+    }
+    const statusToReturn =
+      lastParsed.status >= 400 && lastParsed.status < 600 ? lastParsed.status : 502;
+    return {
+      httpStatus: statusToReturn,
+      body: {
+        error:
+          lastParsed.errorMessage ||
+          `Places API Text Search failed (HTTP ${lastParsed.status}).`,
+      },
+    };
+  }
+
+  const data = lastParsed.data || {};
+  const rawPlaces: Record<string, any>[] = Array.isArray(data.places) ? data.places : [];
+  const parsedMinReviews = Math.max(0, Number(minReviews) || 0);
+
+  // Independently verify candidates missing websiteUri via Place Details (New) with bounded concurrency
+  const detailsMap = new Map<string, Record<string, any>>();
+  if (verifyMissingWebsites !== false && rawPlaces.length > 0) {
+    const candidatesToVerify = rawPlaces.filter((p) => {
+      const hasSearchWeb =
+        typeof p?.websiteUri === 'string' && /^https?:\/\/.+/i.test(p.websiteUri.trim());
+      if (hasSearchWeb) return false;
+      const rRating = typeof p?.rating === 'number' ? p.rating : 0;
+      const rReviews = typeof p?.userRatingCount === 'number' ? p.userRatingCount : 0;
+      return (
+        rRating >= (Number.isFinite(parsedMinRating) ? parsedMinRating : 0) &&
+        rReviews >= parsedMinReviews
+      );
+    });
+
+    const CONCURRENCY = 8;
+    for (let i = 0; i < candidatesToVerify.length; i += CONCURRENCY) {
+      const batch = candidatesToVerify.slice(i, i + CONCURRENCY);
+      const batchDetails = await Promise.all(
+        batch.map(async (p) => {
+          const pid = typeof p.id === 'string' ? p.id : '';
+          if (!pid) return null;
+          const det = await fetchPlaceDetailsForVerification(pid, apiKey, fetchImpl);
+          return det ? { pid, det } : null;
+        })
+      );
+      for (const item of batchDetails) {
+        if (item) {
+          detailsMap.set(item.pid, item.det);
+        }
+      }
+    }
+  }
+
+  const validatedPlaces = rawPlaces
+    .map((p: Record<string, any>) => {
+      const pid = typeof p?.id === 'string' ? p.id : '';
+      const placeDetails = pid ? detailsMap.get(pid) || null : null;
+      return validateAndNormalizePlaceRecord(p, {
+        city: cleanCity,
+        state: cleanState,
+        country: cleanCountry,
+        category: cleanCategory,
+        placeDetails,
+        independentVerificationConfirmed: Boolean(placeDetails),
+      });
+    })
+    .filter(Boolean);
+
+  return {
+    httpStatus: 200,
+    body: {
+      places: validatedPlaces,
+      nextPageToken: typeof data.nextPageToken === 'string' ? data.nextPageToken : '',
+      queryExecuted: queryParts,
+      verifiedDetailsCount: detailsMap.size,
+    },
+  };
 }
 
 app.post(
@@ -541,205 +854,8 @@ app.post(
   requireAuth,
   async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const {
-        city = '',
-        state = '',
-        country = 'India',
-        category = 'Premium salons',
-        keyword = '',
-        customQuery = '',
-        minRating = 0,
-        minReviews = 0,
-        maxResults = 20,
-        pageToken = '',
-        verifyMissingWebsites = true,
-      } = req.body || {};
-
-      const cleanCity = typeof city === 'string' ? city.trim().slice(0, 100) : '';
-      const cleanState = typeof state === 'string' ? state.trim().slice(0, 100) : '';
-      const cleanCountry =
-        typeof country === 'string' && country.trim() ? country.trim().slice(0, 100) : 'India';
-      const cleanCategory =
-        typeof category === 'string' && category.trim()
-          ? category.trim().slice(0, 100)
-          : 'Premium salons';
-      const cleanKeyword = typeof keyword === 'string' ? keyword.trim().slice(0, 120) : '';
-      const cleanCustomQuery =
-        typeof customQuery === 'string' ? customQuery.trim().slice(0, 240) : '';
-
-      if (!cleanCity && !cleanKeyword && !cleanCustomQuery) {
-        return res.status(400).json({
-          error: 'Please provide at least a City or Search Keyword.',
-        });
-      }
-
-      const apiKey = getMapsApiKey();
-      if (!apiKey || apiKey === 'MY_GOOGLE_MAPS_API_KEY') {
-        return res.status(503).json({
-          error:
-            'Google Maps Platform API key (GOOGLE_MAPS_PLATFORM_KEY) is not configured on the server.',
-          missingKey: true,
-        });
-      }
-
-      const locationParts = [cleanCity, cleanState, cleanCountry].filter(Boolean).join(', ');
-      const queryParts =
-        cleanCustomQuery ||
-        (locationParts
-          ? `${cleanKeyword || cleanCategory} in ${locationParts}`
-          : cleanKeyword || cleanCategory);
-
-      // Google Places Text Search (New) supports a maximum of 20 results per page.
-      // Never pretend one API request can return more than 20 results.
-      const pageSize = Math.min(20, Math.max(1, Number(maxResults) || 20));
-      const requestBody: Record<string, unknown> = {
-        textQuery: queryParts,
-        pageSize,
-      };
-
-      const parsedMinRating = Number(minRating);
-      if (Number.isFinite(parsedMinRating) && parsedMinRating > 0) {
-        requestBody.minRating = Math.min(5.0, Math.max(0, parsedMinRating));
-      }
-      const cleanPageToken =
-        typeof pageToken === 'string' ? pageToken.trim().slice(0, 400) : '';
-      if (cleanPageToken) {
-        requestBody.pageToken = cleanPageToken;
-      }
-
-      const fieldMask = [
-        'places.id',
-        'places.displayName',
-        'places.formattedAddress',
-        'places.googleMapsUri',
-        'places.rating',
-        'places.userRatingCount',
-        'places.websiteUri',
-        'places.internationalPhoneNumber',
-        'places.nationalPhoneNumber',
-        'places.businessStatus',
-        'places.location',
-        'places.primaryTypeDisplayName',
-        'nextPageToken',
-      ].join(',');
-
-      let response: globalThis.Response | null = null;
-      let data: Record<string, any> = {};
-
-      // Retry loop for transient 5xx errors or nextPageToken warm-up delay
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) {
-          await sleepMs(attempt * 1200);
-        }
-        trackUsage('places');
-        response = await fetch('https://places.googleapis.com/v1/places:searchText', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': apiKey,
-            'X-Goog-FieldMask': fieldMask,
-            'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-          },
-          body: JSON.stringify(requestBody),
-        });
-
-        const contentType = response.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          if (attempt < 2 && response.status >= 500) continue;
-          return res.status(502).json({
-            error: `Unexpected non-JSON response from Google Places API (status ${response.status}).`,
-          });
-        }
-
-        data = (await response.json()) as Record<string, any>;
-
-        if (response.status === 429 || data?.error?.status === 'RESOURCE_EXHAUSTED') {
-          return res.status(429).json({
-            error: 'Google Maps Platform quota reached.',
-            quotaExceeded: true,
-          });
-        }
-
-        // If pageToken was just issued, Google Places may return 400 INVALID_ARGUMENT if queried <1.5s after token creation
-        if (cleanPageToken && response.status === 400 && attempt < 2) {
-          continue;
-        }
-        if (response.status >= 500 && attempt < 2) {
-          continue;
-        }
-        break;
-      }
-
-      if (!response || !response.ok) {
-        if (cleanPageToken && response?.status === 400) {
-          return res.status(200).json({
-            places: [],
-            nextPageToken: '',
-            queryExecuted: queryParts,
-            verifiedDetailsCount: 0,
-            pageTokenExhausted: true,
-          });
-        }
-        return res.status(response?.status || 500).json({
-          error: data?.error?.message || `Places API Text Search failed (${response?.status}).`,
-        });
-      }
-
-      const rawPlaces: Record<string, any>[] = Array.isArray(data?.places) ? data.places : [];
-      const parsedMinReviews = Math.max(0, Number(minReviews) || 0);
-
-      // Independently verify candidates missing websiteUri via Place Details (New) with bounded concurrency
-      const detailsMap = new Map<string, Record<string, any>>();
-      if (verifyMissingWebsites !== false) {
-        const candidatesToVerify = rawPlaces.filter((p) => {
-          const hasSearchWeb =
-            typeof p?.websiteUri === 'string' && /^https?:\/\/.+/i.test(p.websiteUri.trim());
-          if (hasSearchWeb) return false;
-          const rRating = typeof p?.rating === 'number' ? p.rating : 0;
-          const rReviews = typeof p?.userRatingCount === 'number' ? p.userRatingCount : 0;
-          return rRating >= (Number.isFinite(parsedMinRating) ? parsedMinRating : 0) && rReviews >= parsedMinReviews;
-        });
-
-        const CONCURRENCY = 5;
-        for (let i = 0; i < candidatesToVerify.length; i += CONCURRENCY) {
-          const batch = candidatesToVerify.slice(i, i + CONCURRENCY);
-          const batchDetails = await Promise.all(
-            batch.map(async (p) => {
-              const pid = typeof p.id === 'string' ? p.id : '';
-              if (!pid) return null;
-              const det = await fetchPlaceDetailsForVerification(pid, apiKey);
-              return det ? { pid, det } : null;
-            })
-          );
-          for (const item of batchDetails) {
-            if (item) {
-              detailsMap.set(item.pid, item.det);
-            }
-          }
-        }
-      }
-
-      const validatedPlaces = rawPlaces
-        .map((p: Record<string, any>) => {
-          const pid = typeof p?.id === 'string' ? p.id : '';
-          const placeDetails = pid ? detailsMap.get(pid) || null : null;
-          return validateAndNormalizePlaceRecord(p, {
-            city: cleanCity,
-            state: cleanState,
-            country: cleanCountry,
-            category: cleanCategory,
-            placeDetails,
-            independentVerificationConfirmed: Boolean(placeDetails),
-          });
-        })
-        .filter(Boolean);
-
-      return res.json({
-        places: validatedPlaces,
-        nextPageToken: typeof data?.nextPageToken === 'string' ? data.nextPageToken : '',
-        queryExecuted: queryParts,
-        verifiedDetailsCount: detailsMap.size,
-      });
+      const result = await executeGooglePlacesTextSearch(req.body || {});
+      return res.status(result.httpStatus).json(result.body);
     } catch (error: any) {
       secureLog('ERROR', 'places_search_text_error', { error: error.message });
       return res.status(500).json({
@@ -822,31 +938,29 @@ app.post(
             },
           },
         }),
+        signal: AbortSignal.timeout(8000),
       });
 
-      const contentType = response.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        return res.status(502).json({
-          error: `Unexpected non-JSON response from Google Places Nearby Search (${response.status}).`,
-        });
-      }
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        response,
+        'Google Places Nearby Search (New)'
+      );
 
-      const data = (await response.json()) as Record<string, any>;
-
-      if (response.status === 429 || data?.error?.status === 'RESOURCE_EXHAUSTED') {
+      if (parsed.isQuotaExceeded || parsed.status === 429) {
         return res.status(429).json({
-          error: 'Google Maps Platform quota reached.',
+          error: parsed.errorMessage || 'Google Maps Platform quota reached.',
           quotaExceeded: true,
         });
       }
 
-      if (!response.ok) {
-        return res.status(response.status).json({
-          error: data?.error?.message || `Places API Nearby Search failed (${response.status}).`,
+      if (!parsed.ok || !parsed.data) {
+        return res.status(parsed.status >= 400 ? parsed.status : 502).json({
+          error:
+            parsed.errorMessage || `Places API Nearby Search failed (${parsed.status}).`,
         });
       }
 
-      const rawPlaces = Array.isArray(data?.places) ? data.places : [];
+      const rawPlaces = Array.isArray(parsed.data.places) ? parsed.data.places : [];
       const validatedPlaces = rawPlaces
         .map((p: unknown) =>
           validateAndNormalizePlaceRecord(p, {
@@ -869,7 +983,7 @@ app.get(
   requireAuth,
   async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const placeId = String(req.params.placeId || '').trim();
+      const placeId = String(req.params.placeId || '').trim().replace(/^places\//i, '');
       if (!placeId || placeId.length > 200 || !/^[a-zA-Z0-9_\-]+$/.test(placeId)) {
         return res.status(400).json({ error: 'Valid Google Place ID is required.' });
       }
@@ -893,9 +1007,11 @@ app.get(
         'userRatingCount',
         'websiteUri',
         'internationalPhoneNumber',
+        'nationalPhoneNumber',
         'regularOpeningHours',
         'businessStatus',
         'location',
+        'editorialSummary',
       ].join(',');
 
       const url = `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`;
@@ -907,33 +1023,31 @@ app.get(
           'X-Goog-FieldMask': fields,
           'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
         },
+        signal: AbortSignal.timeout(8000),
       });
 
-      const contentType = response.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        return res.status(502).json({
-          error: `Unexpected non-JSON response from Place Details API (${response.status}).`,
-        });
-      }
+      const parsed = await safeParseHttpResponse<Record<string, any>>(
+        response,
+        'Google Place Details (New)'
+      );
 
-      const data = (await response.json()) as Record<string, any>;
-      if (response.status === 429 || data?.error?.status === 'RESOURCE_EXHAUSTED') {
+      if (parsed.isQuotaExceeded || parsed.status === 429) {
         return res.status(429).json({
-          error: 'Google Maps Platform quota reached.',
+          error: parsed.errorMessage || 'Google Maps Platform quota reached.',
           quotaExceeded: true,
         });
       }
-      if (!response.ok) {
-        return res.status(response.status).json({
-          error: data?.error?.message || `Failed to fetch Place Details (${response.status}).`,
+      if (!parsed.ok || !parsed.data) {
+        return res.status(parsed.status >= 400 ? parsed.status : 502).json({
+          error: parsed.errorMessage || `Failed to fetch Place Details (${parsed.status}).`,
         });
       }
 
-      if (!data || typeof data.id !== 'string') {
+      if (typeof parsed.data.id !== 'string') {
         return res.status(502).json({ error: 'Invalid Place Details payload returned by upstream.' });
       }
 
-      return res.json({ place: data });
+      return res.json({ place: parsed.data });
     } catch (error: any) {
       secureLog('ERROR', 'places_details_error', { error: error.message });
       return res.status(500).json({ error: error.message || 'Place details lookup failed.' });
@@ -1265,6 +1379,14 @@ app.post(
     }
   }
 );
+
+// Explicit JSON 404 handler for any unmatched /api/* route so the server never returns plain text or HTML
+app.use('/api', (req: Request, res: Response) => {
+  return res.status(404).json({
+    error: `API route not found: ${req.method} ${req.originalUrl}`,
+    code: 'API_ROUTE_NOT_FOUND',
+  });
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

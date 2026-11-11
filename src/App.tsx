@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   BarChart3,
@@ -22,9 +22,12 @@ import {
 import {
   authenticatedFetch,
   fetchWorkspaceData,
+  getStoredSession,
   initializeAuthSession,
   loginWithEmailPassword,
   registerWithEmailPassword,
+  saveLeadViaSupabaseClient,
+  saveLocalFallbackLeads,
   SessionUser,
   signOutSession,
 } from './lib/supabase';
@@ -38,6 +41,7 @@ import {
 import {
   canTransitionLeadStatus,
   detectDuplicateLead,
+  safeParseHttpResponse,
 } from './utils/scoringAndCrm';
 import { DashboardView } from './components/DashboardView';
 import { LeadFinderView } from './components/LeadFinderView';
@@ -106,6 +110,10 @@ export default function App() {
   // Database Records (Loaded strictly from authenticated backend / Supabase PostgreSQL)
   const [profile, setProfile] = useState<UserProfile>(DEFAULT_EMPTY_PROFILE);
   const [leads, setLeads] = useState<LeadRecord[]>([]);
+  const leadsRef = useRef<LeadRecord[]>([]);
+  useEffect(() => {
+    leadsRef.current = leads;
+  }, [leads]);
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [activities, setActivities] = useState<ActivityRecord[]>([]);
   const [followups, setFollowups] = useState<FollowupRecord[]>([]);
@@ -118,19 +126,27 @@ export default function App() {
     return () => window.removeEventListener('gmp-quota-exceeded', onQuotaExceeded);
   }, []);
 
-  // Load server integration config (without exposing any raw API keys)
+  // Load server integration config safely (without exposing any raw API keys)
   useEffect(() => {
     fetch('/api/integrations/status')
-      .then((r) => r.json())
-      .then((data) => {
-        setPlacesConfigured(Boolean(data?.googlePlaces?.configured));
-        setMetaGraphConfigured(Boolean(data?.metaGraph?.configured));
-        if (data?.database?.engine) {
-          setSupabaseEngineLabel(data.database.engine);
+      .then((r) => safeParseHttpResponse<Record<string, any>>(r, 'Integrations Status'))
+      .then((parsed) => {
+        if (parsed.ok && parsed.data) {
+          setPlacesConfigured(
+            Boolean(parsed.data?.googlePlaces?.configured) || Boolean(mapsBrowserKey)
+          );
+          setMetaGraphConfigured(Boolean(parsed.data?.metaGraph?.configured));
+          if (parsed.data?.supabaseDb?.mode) {
+            setSupabaseEngineLabel(parsed.data.supabaseDb.mode);
+          }
+        } else if (mapsBrowserKey) {
+          setPlacesConfigured(true);
         }
       })
-      .catch(() => null);
-  }, []);
+      .catch(() => {
+        if (mapsBrowserKey) setPlacesConfigured(true);
+      });
+  }, [mapsBrowserKey]);
 
   const loadWorkspaceRecords = useCallback(async () => {
     setWorkspaceLoading(true);
@@ -215,7 +231,8 @@ export default function App() {
     candidate: Partial<LeadRecord>,
     existingId?: string
   ): Promise<{ saved: boolean; lead?: LeadRecord; message: string }> => {
-    const existing = existingId ? leads.find((l) => l.id === existingId) : undefined;
+    const currentLeads = leadsRef.current;
+    const existing = existingId ? currentLeads.find((l) => l.id === existingId) : undefined;
 
     if (existing && candidate.status) {
       const guard = canTransitionLeadStatus(existing.status, candidate.status);
@@ -224,7 +241,7 @@ export default function App() {
       }
     }
 
-    const dup = detectDuplicateLead(candidate, leads, existingId);
+    const dup = detectDuplicateLead(candidate, currentLeads, existingId);
     if (!existingId && dup.isDuplicate) {
       return {
         saved: false,
@@ -243,29 +260,55 @@ export default function App() {
         method,
         body: JSON.stringify(candidate),
       });
-      const data = await res.json();
+      const parsed = await safeParseHttpResponse<Record<string, any>>(res, 'Save Lead API');
 
-      if (!res.ok) {
+      if (parsed.isNotFoundPage) {
+        const activeUser = currentUser || getStoredSession();
+        if (activeUser) {
+          const fallbackRes = await saveLeadViaSupabaseClient(
+            activeUser,
+            candidate,
+            leadsRef.current,
+            existingId
+          );
+          if (fallbackRes.saved && fallbackRes.lead) {
+            const savedLead = fallbackRes.lead;
+            const nextLeads = existingId
+              ? leadsRef.current.map((l) => (l.id === existingId ? savedLead : l))
+              : [savedLead, ...leadsRef.current];
+            leadsRef.current = nextLeads;
+            setLeads(nextLeads);
+            saveLocalFallbackLeads(activeUser.id, nextLeads);
+            setSelectedLead(savedLead);
+          }
+          return fallbackRes;
+        }
+      }
+
+      if (!parsed.ok || !parsed.data?.lead) {
         return {
           saved: false,
-          lead: data?.matchedLead,
-          message: data?.error || 'Failed to save lead to database.',
+          lead: parsed.data?.lead || parsed.data?.matchedLead,
+          message:
+            parsed.data?.message ||
+            parsed.errorMessage ||
+            'Failed to save lead to database.',
         };
       }
 
-      const savedLead: LeadRecord = data.lead;
-      setLeads((prev) =>
-        existingId
-          ? prev.map((l) => (l.id === existingId ? savedLead : l))
-          : [savedLead, ...prev]
-      );
+      const savedLead: LeadRecord = parsed.data.lead;
+      const nextLeads = existingId
+        ? leadsRef.current.map((l) => (l.id === existingId ? savedLead : l))
+        : [savedLead, ...leadsRef.current];
+      leadsRef.current = nextLeads;
+      setLeads(nextLeads);
       setSelectedLead(savedLead);
 
       return {
         saved: true,
         lead: savedLead,
         message:
-          data.message ||
+          parsed.data.message ||
           `Saved "${savedLead.businessName}" (Score: ${savedLead.leadScore}/100).`,
       };
     } catch (err: any) {
@@ -282,7 +325,9 @@ export default function App() {
         method: 'DELETE',
       });
       if (res.ok) {
-        setLeads((prev) => prev.filter((l) => l.id !== id));
+        const nextLeads = leadsRef.current.filter((l) => l.id !== id);
+        leadsRef.current = nextLeads;
+        setLeads(nextLeads);
         setMessages((prev) => prev.filter((m) => m.leadId !== id));
         setFollowups((prev) => prev.filter((f) => f.leadId !== id));
         if (selectedLead?.id === id) {
@@ -296,7 +341,7 @@ export default function App() {
 
   const handleBulkAddTag = async (ids: string[], tag: string) => {
     for (const id of ids) {
-      const target = leads.find((l) => l.id === id);
+      const target = leadsRef.current.find((l) => l.id === id);
       if (!target) continue;
       const existingTags = target.tags
         ? target.tags.split(',').map((t) => t.trim()).filter(Boolean)
@@ -315,19 +360,19 @@ export default function App() {
       method: 'POST',
       body: JSON.stringify(msgInput),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data?.error || 'Failed to save outreach message.');
+    const parsed = await safeParseHttpResponse<Record<string, any>>(res, 'Save Message API');
+    if (!parsed.ok) {
+      throw new Error(parsed.errorMessage || 'Failed to save outreach message.');
     }
 
-    if (data.message) {
-      setMessages((prev) => [data.message as MessageRecord, ...prev]);
+    if (parsed.data?.message) {
+      setMessages((prev) => [parsed.data!.message as MessageRecord, ...prev]);
     }
     await loadWorkspaceRecords();
   };
 
   const handleMarkLeadOptedOut = async (leadId: string) => {
-    const target = leads.find((l) => l.id === leadId);
+    const target = leadsRef.current.find((l) => l.id === leadId);
     if (!target) return;
     await handleSaveOrUpdateLead({ ...target, status: 'opted_out' }, leadId);
   };
@@ -347,9 +392,9 @@ export default function App() {
         notes,
       }),
     });
-    const data = await res.json();
-    if (res.ok && data.followup) {
-      setFollowups((prev) => [data.followup as FollowupRecord, ...prev]);
+    const parsed = await safeParseHttpResponse<Record<string, any>>(res, 'Schedule Follow-Up API');
+    if (parsed.ok && parsed.data?.followup) {
+      setFollowups((prev) => [parsed.data!.followup as FollowupRecord, ...prev]);
       await loadWorkspaceRecords();
     }
   };
@@ -359,10 +404,10 @@ export default function App() {
       `/api/crm/followups/${encodeURIComponent(followupId)}/complete`,
       { method: 'PATCH' }
     );
-    const data = await res.json();
-    if (res.ok && data.followup) {
+    const parsed = await safeParseHttpResponse<Record<string, any>>(res, 'Complete Follow-Up API');
+    if (parsed.ok && parsed.data?.followup) {
       setFollowups((prev) =>
-        prev.map((item) => (item.id === followupId ? (data.followup as FollowupRecord) : item))
+        prev.map((item) => (item.id === followupId ? (parsed.data!.followup as FollowupRecord) : item))
       );
     }
   };
@@ -372,9 +417,9 @@ export default function App() {
       method: 'PUT',
       body: JSON.stringify(updated),
     });
-    const data = await res.json();
-    if (res.ok && data.profile) {
-      setProfile(data.profile as UserProfile);
+    const parsed = await safeParseHttpResponse<Record<string, any>>(res, 'Update Profile API');
+    if (parsed.ok && parsed.data?.profile) {
+      setProfile(parsed.data.profile as UserProfile);
     }
   };
 
